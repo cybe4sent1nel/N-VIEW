@@ -15,7 +15,7 @@ N-VIEW is a high-standard Nmap CLI companion focused on speed, clarity, and guid
 
 Developed by Fahad Khan (cybe4sent1nel)
 
-Sponsor our project: fahadkhanxyz8816@gmail.com
+Sponsor our project- donate through paypal: fahadkhanxyz8816@gmail.com
 
 ## Demo Screenshots
 
