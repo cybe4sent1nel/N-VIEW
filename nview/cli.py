@@ -1,12 +1,14 @@
 import json
 import os
 import platform
+import csv
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +64,25 @@ PROVIDER_OPENROUTER = "openrouter"
 DEFAULT_CEREBRAS_MODEL = "qwen-3-235b-a22b-instruct-2507"
 DEFAULT_OPENROUTER_MODEL = "openrouter/auto"
 
+HIGH_RISK_PORTS = {
+    21: "FTP (plain auth)",
+    23: "Telnet (cleartext remote shell)",
+    135: "MSRPC",
+    139: "NetBIOS",
+    445: "SMB",
+    1433: "MSSQL",
+    1521: "Oracle DB",
+    2375: "Docker remote API",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    6379: "Redis",
+    8080: "HTTP alternate",
+    9200: "Elasticsearch",
+    27017: "MongoDB",
+}
+
 
 @dataclass
 class AIConfig:
@@ -95,6 +116,8 @@ class AIConfig:
 class ScanRunResult:
     xml_output: Path
     txt_output: Path
+    normal_output: Optional[Path]
+    grepable_output: Optional[Path]
     command: str
     started_at: datetime
     finished_at: datetime
@@ -189,13 +212,9 @@ def print_banner() -> None:
 
 
 def render_ai_report(report_text: str, provider: str) -> None:
-    console.print(
-        Panel(
-            Markdown(report_text),
-            title=f"AI Security Report ({provider})",
-            border_style="bright_green",
-        )
-    )
+    console.print(Panel.fit(f"[bold green]AI Security Report ({provider})[/bold green]", border_style="bright_green"))
+    # Print markdown directly to preserve full rich rendering semantics (tables, headings, lists).
+    console.print(Markdown(report_text), soft_wrap=True)
 
 
 def resolve_nmap_binary() -> Optional[str]:
@@ -437,6 +456,52 @@ def validate_target(target: str) -> None:
         raise typer.BadParameter("Target seems invalid (too long).")
 
 
+def sanitize_flags(flags: str) -> str:
+    return re.sub(r"\s+", " ", flags).strip()
+
+
+def remove_flag_pattern(flags: str, pattern: str) -> str:
+    return sanitize_flags(re.sub(pattern, " ", flags))
+
+
+def augment_scan_flags(
+    base_flags: str,
+    ports: Optional[str] = None,
+    top_ports: Optional[int] = None,
+    timing: Optional[int] = None,
+    udp: bool = False,
+    os_detect: bool = False,
+    scripts: Optional[str] = None,
+    no_ping: bool = False,
+) -> str:
+    flags = sanitize_flags(base_flags)
+
+    if ports:
+        flags = remove_flag_pattern(flags, r"(?:^|\s)-p\s+\S+")
+        flags = sanitize_flags(f"{flags} -p {ports}")
+
+    if top_ports is not None:
+        flags = remove_flag_pattern(flags, r"(?:^|\s)--top-ports\s+\d+")
+        flags = sanitize_flags(f"{flags} --top-ports {top_ports}")
+
+    if timing is not None:
+        flags = remove_flag_pattern(flags, r"(?:^|\s)-T[0-5]")
+        flags = sanitize_flags(f"{flags} -T{timing}")
+
+    if udp and "-sU" not in flags:
+        flags = sanitize_flags(f"{flags} -sU")
+    if os_detect and "-O" not in flags and "-A" not in flags:
+        flags = sanitize_flags(f"{flags} -O")
+    if no_ping and "-Pn" not in flags:
+        flags = sanitize_flags(f"{flags} -Pn")
+
+    if scripts:
+        flags = remove_flag_pattern(flags, r"(?:^|\s)--script\s+\S+")
+        flags = sanitize_flags(f"{flags} --script {scripts}")
+
+    return flags
+
+
 def numbered_choice(title: str, options: list[str], default: Optional[int] = None) -> int:
     console.print(f"\n[bold]{title}[/bold]")
     for idx, option in enumerate(options, start=1):
@@ -444,10 +509,12 @@ def numbered_choice(title: str, options: list[str], default: Optional[int] = Non
 
     while True:
         raw = Prompt.ask("Select a number", default=str(default) if default else None)
-        if not raw.isdigit():
+        match = re.match(r"^\s*(\d+)", raw)
+        parsed = match.group(1) if match else raw.strip()
+        if not parsed.isdigit():
             console.print("[red]Please enter a number.[/red]")
             continue
-        value = int(raw)
+        value = int(parsed)
         if 1 <= value <= len(options):
             return value
         console.print(f"[red]Out of range. Use 1-{len(options)}.[/red]")
@@ -503,38 +570,77 @@ def choose_scan_profile() -> tuple[str, str]:
     return raw, "Custom"
 
 
-def run_scan(target: str, flags: str, output_prefix: Path) -> ScanRunResult:
+def run_scan(
+    target: Optional[str],
+    flags: str,
+    output_prefix: Path,
+    target_file: Optional[Path] = None,
+    retries: int = 1,
+    save_all_formats: bool = True,
+) -> ScanRunResult:
     nmap_bin = ensure_nmap(auto_install=True)
-    validate_target(target)
+    if target_file is None:
+        if not target:
+            raise typer.BadParameter("Target is required when --target-file is not provided.")
+        validate_target(target)
+    elif not target_file.exists():
+        raise typer.BadParameter(f"Target file does not exist: {target_file}")
+
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     xml_output = output_prefix.with_suffix(".xml")
     txt_output = output_prefix.with_suffix(".txt")
+    normal_output = output_prefix.with_suffix(".nmap") if save_all_formats else None
+    grepable_output = output_prefix.with_suffix(".gnmap") if save_all_formats else None
 
     parsed_flags = shlex.split(flags, posix=False)
-    cmd = [nmap_bin] + parsed_flags + ["-oX", str(xml_output), target]
-    started_at = datetime.now()
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-        task_id = progress.add_task("Running Nmap scan...", total=None)
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        progress.update(task_id, description="Scan finished")
-    finished_at = datetime.now()
+    cmd = [nmap_bin] + parsed_flags + ["-oX", str(xml_output)]
+    if normal_output is not None:
+        cmd.extend(["-oN", str(normal_output)])
+    if grepable_output is not None:
+        cmd.extend(["-oG", str(grepable_output)])
+    if target_file is not None:
+        cmd.extend(["-iL", str(target_file)])
+    else:
+        cmd.append(target or "")
 
-    txt_output.write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
-    if proc.returncode != 0:
-        raise RuntimeError(f"Nmap failed with exit code {proc.returncode}. See {txt_output} for details.")
+    max_attempts = max(1, retries + 1)
+    last_proc = None
+    last_started = datetime.now()
+    last_finished = datetime.now()
+    for attempt in range(1, max_attempts + 1):
+        last_started = datetime.now()
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+            task_id = progress.add_task(f"Running Nmap scan (attempt {attempt}/{max_attempts})...", total=None)
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            progress.update(task_id, description="Scan finished")
+        last_finished = datetime.now()
+        last_proc = proc
+
+        txt_output.write_text(proc.stdout + "\n" + proc.stderr, encoding="utf-8")
+        if proc.returncode == 0 and xml_output.exists():
+            break
+        if attempt < max_attempts:
+            console.print(f"[yellow]Attempt {attempt} failed, retrying...[/yellow]")
+
+    if last_proc is None:
+        raise RuntimeError("Nmap execution did not start.")
+    if last_proc.returncode != 0:
+        raise RuntimeError(f"Nmap failed with exit code {last_proc.returncode}. See {txt_output} for details.")
     if not xml_output.exists():
         raise RuntimeError("Nmap did not produce XML output; cannot continue to reporting.")
 
     return ScanRunResult(
         xml_output=xml_output,
         txt_output=txt_output,
+        normal_output=normal_output,
+        grepable_output=grepable_output,
         command=" ".join(cmd),
-        started_at=started_at,
-        finished_at=finished_at,
-        duration_seconds=(finished_at - started_at).total_seconds(),
-        return_code=proc.returncode,
-        stdout=proc.stdout,
-        stderr=proc.stderr,
+        started_at=last_started,
+        finished_at=last_finished,
+        duration_seconds=(last_finished - last_started).total_seconds(),
+        return_code=last_proc.returncode,
+        stdout=last_proc.stdout,
+        stderr=last_proc.stderr,
     )
 
 
@@ -727,16 +833,56 @@ def save_reports(scan_data: dict, ai_report: Optional[str], provider_used: Optio
     parsed_path = output_prefix.with_name(output_prefix.name + "_parsed.json")
     parsed_path.write_text(json.dumps(scan_data, indent=2), encoding="utf-8")
 
+    csv_path = output_prefix.with_name(output_prefix.name + "_open_ports.csv")
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["target", "port", "protocol", "service", "product", "version"])
+        for item in scan_data.get("open_ports", []):
+            writer.writerow(
+                [
+                    item.get("target", ""),
+                    item.get("port", ""),
+                    item.get("protocol", ""),
+                    item.get("service", ""),
+                    item.get("product", ""),
+                    item.get("version", ""),
+                ]
+            )
+
+    summary = scan_data.get("summary", {})
+    summary_path = output_prefix.with_name(output_prefix.name + "_summary.md")
+    summary_md = (
+        f"# {APP_NAME} Scan Summary\n\n"
+        f"Generated: {datetime.now().isoformat()}\n\n"
+        f"- Targets: {summary.get('target_count', 0)}\n"
+        f"- Targets Up: {summary.get('up_count', 0)}\n"
+        f"- Open Ports: {summary.get('open_port_count', 0)}\n"
+        f"- NSE Script Findings: {summary.get('script_findings', 0)}\n"
+    )
+    summary_path.write_text(summary_md, encoding="utf-8")
+
     if ai_report:
         report_path = output_prefix.with_name(output_prefix.name + "_ai_report.md")
+        report_txt_path = output_prefix.with_name(output_prefix.name + "_ai_report.txt")
+        report_html_path = output_prefix.with_name(output_prefix.name + "_ai_report.html")
         header = (
             f"# {APP_NAME} AI Security Report\n\n"
             f"Generated: {datetime.now().isoformat()}\n\n"
             f"Provider: {provider_used}\n\n"
             f"Analyst: {DEVELOPER}\n\n"
         )
-        report_path.write_text(header + ai_report, encoding="utf-8")
+        markdown_report = header + ai_report
+        report_path.write_text(markdown_report, encoding="utf-8")
+
+        # Export polished non-markdown artifacts for direct sharing and review.
+        render_console = Console(record=True, width=120)
+        render_console.print(Markdown(markdown_report))
+        report_txt_path.write_text(render_console.export_text(), encoding="utf-8")
+        report_html_path.write_text(render_console.export_html(inline_styles=True), encoding="utf-8")
+
         console.print(f"[green]AI report saved:[/green] {report_path}")
+        console.print(f"[green]Plain text report saved:[/green] {report_txt_path}")
+        console.print(f"[green]HTML report saved:[/green] {report_html_path}")
 
 
 def latest_report_file() -> Optional[Path]:
@@ -744,6 +890,30 @@ def latest_report_file() -> Optional[Path]:
         return None
     files = sorted(OUTPUT_DIR.glob("*_ai_report.md"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
+
+
+@app.command("report")
+def report_command(
+    latest: bool = typer.Option(True, "--latest/--no-latest", help="Render the latest AI report."),
+    file: Optional[Path] = typer.Option(None, "--file", help="Render a specific AI report markdown file."),
+) -> None:
+    """Render AI report markdown in terminal using rich formatting."""
+    print_banner()
+
+    selected: Optional[Path] = None
+    if file is not None:
+        if not file.exists():
+            raise typer.BadParameter(f"Report file not found: {file}")
+        selected = file
+    elif latest:
+        selected = latest_report_file()
+
+    if selected is None:
+        console.print("[yellow]No report file found. Run a scan with AI enabled first.[/yellow]")
+        return
+
+    content = selected.read_text(encoding="utf-8", errors="ignore")
+    render_ai_report(content, "from file")
 
 
 def show_scan_process_details(result: ScanRunResult, target: str, flags: str, profile_name: str) -> None:
@@ -771,6 +941,136 @@ def show_scan_summary(scan_data: dict) -> None:
     table.add_row("Open Ports", str(summary["open_port_count"]))
     table.add_row("NSE Script Findings", str(summary["script_findings"]))
     console.print(table)
+
+
+def extract_target_from_stem(stem: str) -> str:
+    return re.sub(r"_\d{8}_\d{6}$", "", stem)
+
+
+def render_bar(value: int, maximum: int, width: int = 24) -> str:
+    if maximum <= 0:
+        maximum = 1
+    filled = int((value / maximum) * width)
+    filled = min(width, max(0, filled))
+    return "█" * filled + "░" * (width - filled)
+
+
+def calculate_exposure(scan_data: dict) -> dict:
+    open_ports = scan_data.get("open_ports", [])
+    scripts = scan_data.get("scripts", [])
+    targets = scan_data.get("targets", [])
+
+    service_counter = Counter(str(item.get("service", "unknown")).lower() for item in open_ports)
+    target_counter = Counter(str(item.get("target", "unknown")) for item in open_ports)
+
+    risky_ports = []
+    risk_points = 0
+    for item in open_ports:
+        port_raw = str(item.get("port", ""))
+        service = str(item.get("service", "")).lower()
+        try:
+            port_num = int(port_raw)
+        except Exception:
+            port_num = -1
+
+        if port_num in HIGH_RISK_PORTS:
+            risky_ports.append((port_num, HIGH_RISK_PORTS[port_num]))
+            risk_points += 7
+        if service in {"telnet", "ftp", "smb", "rdp", "vnc", "mongodb", "redis", "mysql", "postgresql"}:
+            risk_points += 4
+
+    risk_points += len(open_ports) * 2
+    risk_points += len(scripts) * 6
+    risk_points += max(0, len(target_counter) - 1) * 3
+
+    risk_score = min(100, risk_points)
+    if risk_score >= 70:
+        level = "HIGH"
+    elif risk_score >= 35:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    unique_risky = sorted({f"{port}/{desc}" for port, desc in risky_ports})
+    return {
+        "risk_score": risk_score,
+        "risk_level": level,
+        "service_counter": service_counter,
+        "target_counter": target_counter,
+        "risky_ports": unique_risky,
+        "target_total": len(targets),
+        "up_total": sum(1 for t in targets if str(t.get("state", "")).lower() == "up"),
+        "open_port_total": len(open_ports),
+        "script_total": len(scripts),
+    }
+
+
+def show_visual_exposure_dashboard(scan_data: dict) -> None:
+    stats = calculate_exposure(scan_data)
+    level_color = "green" if stats["risk_level"] == "LOW" else "yellow" if stats["risk_level"] == "MEDIUM" else "red"
+    score_bar = render_bar(stats["risk_score"], 100)
+    console.print(
+        Panel.fit(
+            f"[bold]Threat Score:[/bold] [{level_color}]{stats['risk_score']} / 100[/{level_color}]\n"
+            f"[bold]Risk Level:[/bold] [{level_color}]{stats['risk_level']}[/{level_color}]\n"
+            f"[bold]Score Bar:[/bold] [{level_color}]{score_bar}[/{level_color}]",
+            title="Exposure Radar",
+            border_style=level_color,
+        )
+    )
+
+    svc_table = Table(title="Service Distribution")
+    svc_table.add_column("Service", style="cyan")
+    svc_table.add_column("Count", style="white")
+    svc_table.add_column("Visual", style="white")
+    max_svc = max(stats["service_counter"].values()) if stats["service_counter"] else 1
+    for service, count in stats["service_counter"].most_common(10):
+        svc_table.add_row(service, str(count), render_bar(count, max_svc))
+    if not stats["service_counter"]:
+        svc_table.add_row("none", "0", render_bar(0, 1))
+    console.print(svc_table)
+
+    host_table = Table(title="Host Exposure Heatmap")
+    host_table.add_column("Target", style="cyan")
+    host_table.add_column("Open Ports", style="white")
+    host_table.add_column("Visual", style="white")
+    max_host = max(stats["target_counter"].values()) if stats["target_counter"] else 1
+    for target, count in stats["target_counter"].most_common(10):
+        host_table.add_row(target, str(count), render_bar(count, max_host))
+    if not stats["target_counter"]:
+        host_table.add_row("none", "0", render_bar(0, 1))
+    console.print(host_table)
+
+
+def show_prioritized_recommendations(scan_data: dict) -> None:
+    stats = calculate_exposure(scan_data)
+    recommendations: list[str] = []
+    if stats["open_port_total"] == 0:
+        recommendations.append("No open ports found. Verify scan depth and target scope to avoid false negatives.")
+    if stats["risk_level"] == "HIGH":
+        recommendations.append("Apply immediate containment: restrict exposed management/database ports via firewall ACLs.")
+    if any("445/" in r or "139/" in r for r in stats["risky_ports"]):
+        recommendations.append("Harden SMB/NetBIOS exposure: enforce host firewall rules, SMB signing, and segmentation.")
+    if any("23/" in r for r in stats["risky_ports"]):
+        recommendations.append("Remove Telnet and migrate to SSH-only management with key-based auth.")
+    if any("3389/" in r for r in stats["risky_ports"]):
+        recommendations.append("Protect RDP behind VPN or JIT access and enforce MFA + account lockout.")
+    if stats["script_total"] > 0:
+        recommendations.append("Review NSE findings first and patch high-confidence weaknesses before broad hardening.")
+    if not recommendations:
+        recommendations.append("Baseline appears stable. Continue least-privilege firewalling and periodic scan diffs.")
+
+    rec_table = Table(title="Prioritized Recommendations")
+    rec_table.add_column("Priority", style="cyan")
+    rec_table.add_column("Action", style="white")
+    for idx, item in enumerate(recommendations, start=1):
+        priority = "P1" if idx <= 2 else "P2" if idx <= 4 else "P3"
+        rec_table.add_row(priority, item)
+    console.print(rec_table)
+
+    risky = stats["risky_ports"]
+    risky_text = "\n".join(f"- {item}" for item in risky[:15]) if risky else "- none"
+    console.print(Panel.fit(risky_text, title="High-Risk Port Indicators", border_style="bright_magenta"))
 
 
 def show_detailed_scan_results(scan_data: dict) -> None:
@@ -820,27 +1120,45 @@ def show_detailed_scan_results(scan_data: dict) -> None:
         console.print(script_table)
 
 
+def render_scan_analytics(scan_data: dict) -> None:
+    show_visual_exposure_dashboard(scan_data)
+    show_prioritized_recommendations(scan_data)
+
+
 def run_scan_pipeline(
-    target: str,
+    target: Optional[str],
     flags: str,
     profile_name: str,
     cfg: AIConfig,
     ask_for_ai: bool,
+    target_file: Optional[Path] = None,
+    retries: int = 1,
+    save_all_formats: bool = True,
     generate_ai: bool = True,
     always_show_report: bool = True,
 ) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    clean_target = re.sub(r"[^a-zA-Z0-9_.-]+", "_", target)
+    display_target = target if target else f"file:{target_file}"
+    clean_target = re.sub(r"[^a-zA-Z0-9_.-]+", "_", display_target)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_prefix = OUTPUT_DIR / f"{clean_target}_{timestamp}"
 
-    console.print(f"\n[bold]Running:[/bold] nmap {flags} {target}")
-    run_result = run_scan(target=target, flags=flags, output_prefix=output_prefix)
+    run_target_text = target if target else f"-iL {target_file}"
+    console.print(f"\n[bold]Running:[/bold] nmap {flags} {run_target_text}")
+    run_result = run_scan(
+        target=target,
+        flags=flags,
+        output_prefix=output_prefix,
+        target_file=target_file,
+        retries=retries,
+        save_all_formats=save_all_formats,
+    )
     scan_data = parse_scan_xml(run_result.xml_output)
 
-    show_scan_process_details(run_result, target=target, flags=flags, profile_name=profile_name)
+    show_scan_process_details(run_result, target=display_target, flags=flags, profile_name=profile_name)
     show_scan_summary(scan_data)
     show_detailed_scan_results(scan_data)
+    render_scan_analytics(scan_data)
 
     raw_scan_output = run_result.txt_output.read_text(encoding="utf-8", errors="ignore")[:10000] if run_result.txt_output.exists() else ""
     xml_excerpt = run_result.xml_output.read_text(encoding="utf-8", errors="ignore")[:12000] if run_result.xml_output.exists() else ""
@@ -856,7 +1174,7 @@ def run_scan_pipeline(
         ensure_ai_configured(run_cfg)
         ai_report, provider_used = generate_ai_report(
             scan_data=scan_data,
-            target=target,
+            target=display_target,
             profile_name=profile_name,
             flags=flags,
             cfg=run_cfg,
@@ -869,6 +1187,12 @@ def run_scan_pipeline(
 
     save_reports(scan_data=scan_data, ai_report=ai_report, provider_used=provider_used, output_prefix=output_prefix)
     console.print(f"[green]Raw XML saved:[/green] {run_result.xml_output}")
+    if run_result.normal_output and run_result.normal_output.exists():
+        console.print(f"[green]Normal output saved:[/green] {run_result.normal_output}")
+    if run_result.grepable_output and run_result.grepable_output.exists():
+        console.print(f"[green]Grepable output saved:[/green] {run_result.grepable_output}")
+    if ai_report:
+        console.print("[cyan]Tip:[/cyan] Use [bold]nview report --latest[/bold] to view the report as rendered markdown in terminal.")
 
 
 def scan_center_menu(cfg: AIConfig) -> None:
@@ -1000,9 +1324,19 @@ def menu_mode() -> None:
 
 @app.command("scan")
 def scan_non_interactive(
-    target: str = typer.Option(..., "--target", "-t", help="Target host, IP, or CIDR."),
+    target: Optional[str] = typer.Option(None, "--target", "-t", help="Target host, IP, or CIDR."),
+    target_file: Optional[Path] = typer.Option(None, "--target-file", help="File containing one target per line."),
     natural_language: Optional[str] = typer.Option(None, "--nl", help="Describe desired scan in natural language and N-VIEW will normalize to flags."),
     flags: Optional[str] = typer.Option(None, "--flags", "-f", help="Explicit nmap flags."),
+    ports: Optional[str] = typer.Option(None, "--ports", help="Override explicit ports (example: 22,80,443 or 1-1024)."),
+    top_ports: Optional[int] = typer.Option(None, "--top-ports", min=1, max=65535, help="Override top ports count."),
+    timing: Optional[int] = typer.Option(None, "--timing", min=0, max=5, help="Set nmap timing template T0-T5."),
+    udp: bool = typer.Option(False, "--udp", help="Include UDP scan mode (-sU)."),
+    os_detect: bool = typer.Option(False, "--os-detect", help="Enable OS detection (-O)."),
+    no_ping: bool = typer.Option(False, "--no-ping", help="Treat hosts as online (-Pn)."),
+    scripts: Optional[str] = typer.Option(None, "--scripts", help="NSE script selector (example: vuln,safe,default)."),
+    retries: int = typer.Option(1, "--retries", min=0, max=5, help="Retry attempts when scan execution fails."),
+    all_formats: bool = typer.Option(True, "--all-formats/--xml-only", help="Save XML + normal + grepable outputs."),
     ai: bool = typer.Option(True, "--ai/--no-ai", help="Generate AI report after scan."),
     show_report: bool = typer.Option(True, "--show-report/--no-show-report", help="Render generated AI report in terminal."),
 ) -> None:
@@ -1010,22 +1344,108 @@ def scan_non_interactive(
     print_banner()
     cfg = load_config()
 
+    if not target and target_file is None:
+        raise typer.BadParameter("Provide --target or --target-file.")
+    if target and target_file is not None:
+        raise typer.BadParameter("Use either --target or --target-file, not both.")
+
     if flags:
-        selected_flags = flags
+        selected_flags = sanitize_flags(flags)
         profile_name = "Custom"
     else:
         selected_flags, profile_name = normalize_natural_language(natural_language or "quick scan")
 
+    selected_flags = augment_scan_flags(
+        base_flags=selected_flags,
+        ports=ports,
+        top_ports=top_ports,
+        timing=timing,
+        udp=udp,
+        os_detect=os_detect,
+        scripts=scripts,
+        no_ping=no_ping,
+    )
+
     run_scan_pipeline(
         target=target,
+        target_file=target_file,
         flags=selected_flags,
         profile_name=profile_name,
         cfg=cfg,
         ask_for_ai=False,
+        retries=retries,
+        save_all_formats=all_formats,
         generate_ai=ai,
         always_show_report=show_report,
     )
     console.print("[bold cyan]Done.[/bold cyan]")
+
+
+@app.command("history")
+def history(limit: int = typer.Option(20, "--limit", min=1, max=200, help="Number of recent scan records to show.")) -> None:
+    """Show recent scan artifacts generated by N-VIEW."""
+    print_banner()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    xml_files = sorted(OUTPUT_DIR.glob("*.xml"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not xml_files:
+        console.print("[yellow]No scan history found yet.[/yellow]")
+        return
+
+    table = Table(title="N-VIEW Scan History")
+    table.add_column("Timestamp", style="cyan")
+    table.add_column("Target", style="white")
+    table.add_column("Risk", style="white")
+    table.add_column("Open Ports", style="white")
+    table.add_column("XML", style="white")
+    table.add_column("NMAP", style="white")
+    table.add_column("GNMAP", style="white")
+    table.add_column("AI Report", style="white")
+
+    for xml_path in xml_files[:limit]:
+        stem = xml_path.stem
+        modified = datetime.fromtimestamp(xml_path.stat().st_mtime).isoformat(timespec="seconds")
+        target = extract_target_from_stem(stem)
+        try:
+            stats = calculate_exposure(parse_scan_xml(xml_path))
+            risk = stats["risk_level"]
+            open_ports = str(stats["open_port_total"])
+        except Exception:
+            risk = "unknown"
+            open_ports = "?"
+        nmap_exists = (OUTPUT_DIR / f"{stem}.nmap").exists()
+        gnmap_exists = (OUTPUT_DIR / f"{stem}.gnmap").exists()
+        ai_exists = (OUTPUT_DIR / f"{stem}_ai_report.md").exists()
+        table.add_row(
+            modified,
+            target,
+            risk,
+            open_ports,
+            "yes",
+            "yes" if nmap_exists else "no",
+            "yes" if gnmap_exists else "no",
+            "yes" if ai_exists else "no",
+        )
+
+    console.print(table)
+
+
+@app.command("analyze")
+def analyze(
+    xml_file: Path = typer.Option(..., "--xml", help="Path to an existing Nmap XML output file."),
+    show_raw: bool = typer.Option(False, "--show-raw", help="Show raw parsed JSON in terminal."),
+) -> None:
+    """Analyze existing Nmap XML with N-VIEW visual intelligence dashboards."""
+    print_banner()
+    if not xml_file.exists():
+        raise typer.BadParameter(f"XML file does not exist: {xml_file}")
+
+    scan_data = parse_scan_xml(xml_file)
+    show_scan_summary(scan_data)
+    show_detailed_scan_results(scan_data)
+    render_scan_analytics(scan_data)
+    if show_raw:
+        console.print(Panel(Markdown(f"```json\n{json.dumps(scan_data, indent=2)}\n```"), title="Parsed JSON", border_style="cyan"))
 
 
 @app.command("configure-ai")

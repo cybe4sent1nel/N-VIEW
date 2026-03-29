@@ -30,6 +30,14 @@ Sponsor our project: fahadkhanxyz8816@gmail.com
 - Dedicated menu centers (Scan Center, Report Center, AI Settings, Tools)
 - Natural-language scan intent normalization
 - Scan profile presets for fast execution
+- Advanced non-interactive scan tuning (`--ports`, `--top-ports`, `--timing`, `--udp`, `--os-detect`, `--scripts`, `--no-ping`)
+- Target file support (`--target-file`) for multi-target operations
+- Resilient scan retries (`--retries`) for transient failures
+- Multi-format scan artifacts (XML, NMAP, GNMAP)
+- Built-in scan history viewer (`history`)
+- Visual exposure analytics: threat score, service distribution bars, host exposure heatmap
+- Prioritized remediation recommendations with high-risk port indicators
+- Offline XML intelligence mode via `analyze`
 - Cross-platform OS detection for runtime diagnostics
 - Dependency checks with automatic Nmap install attempts
 - Manual install fallback instructions when auto-install cannot complete
@@ -94,6 +102,9 @@ Available commands:
 - `version` - Show branding/version banner
 - `doctor` - Validate platform, dependencies, and provider/key setup
 - `bootstrap` - Auto-prepare runtime dependencies and command aliases
+- `history` - Show recent scan records and generated artifact availability
+- `analyze` - Visualize and prioritize findings from existing Nmap XML files
+- `report` - Render saved AI report markdown in terminal with rich formatting
 
 ## Environment Variables
 
@@ -116,6 +127,38 @@ See `.env.example` for template values.
 5. Generate AI report.
 
 Output goes to `./nview-results`.
+
+## Advanced Examples
+
+Single target with advanced controls:
+
+```bash
+nview scan --target 192.168.1.10 --nl "quick scan" --timing 4 --top-ports 500 --scripts default,safe --retries 2
+```
+
+Multi-target file scan:
+
+```bash
+n-view scan --target-file targets.txt --flags "-sV -Pn" --udp --os-detect --xml-only --no-ai
+```
+
+Show recent history:
+
+```bash
+nview history --limit 30
+```
+
+Analyze existing XML:
+
+```bash
+nview analyze --xml ./nview-results/target_20260329_120000.xml
+```
+
+Render latest AI report in terminal (formatted, not raw markdown):
+
+```bash
+nview report --latest
+```
 
 ## Production Notes
 

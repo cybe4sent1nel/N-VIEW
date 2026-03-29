@@ -3,6 +3,15 @@
 - Numbered menu UX
 - Natural-language scan normalization
 - Preset scan profiles
+- Advanced CLI controls for ports, timing, scripts, UDP, OS detection, and ping behavior
+- Target list scanning from file input
+- Retry-enabled resilient scan execution
+- Multi-format output generation (XML, NMAP, GNMAP)
+- Built-in scan history viewer
+- Threat scoring with visual bar indicators
+- Service distribution and host exposure heatmap views
+- Prioritized recommendations based on observed risk signals
+- Offline XML analytics command for post-scan triage
 - OS and distro detection for diagnostics
 - Automatic dependency checks for runtime readiness
 - Automatic Nmap installation attempts on supported package managers
