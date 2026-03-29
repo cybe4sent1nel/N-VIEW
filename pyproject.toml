@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nview"
+version = "2.0.0"
+description = "N-VIEW is a menu-first Nmap power wrapper with natural-language scan normalization and AI-driven reporting."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer",
+    "rich",
+    "httpx"
+]
+
+[project.scripts]
+nview = "nview.cli:entry"
+n-view = "nview.cli:entry"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nview*"]
+exclude = ["assets*", "devDocs*"]
