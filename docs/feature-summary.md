@@ -1,10 +1,13 @@
 # Feature Summary
 
 - Numbered menu UX
+- Dedicated menu architecture (Scan, Discovery, Local System Scan, Reports, AI Settings, Tools)
 - Natural-language scan normalization
 - Preset scan profiles
 - Advanced CLI controls for ports, timing, scripts, UDP, OS detection, and ping behavior
 - Target list scanning from file input
+- Local system scan profiles for quick/full/aggressive/vuln workflows
+- Discovery-only workflows for host and CIDR sweeps
 - Retry-enabled resilient scan execution
 - Multi-format output generation (XML, NMAP, GNMAP)
 - Built-in scan history viewer
@@ -12,6 +15,7 @@
 - Service distribution and host exposure heatmap views
 - Prioritized recommendations based on observed risk signals
 - Offline XML analytics command for post-scan triage
+- Cross-directory AI configuration persistence from `.env` to user config
 - OS and distro detection for diagnostics
 - Automatic dependency checks for runtime readiness
 - Automatic Nmap installation attempts on supported package managers

@@ -30,6 +30,18 @@ Scan from target file:
 nview scan --target-file targets.txt --flags "-sV -Pn" --udp --os-detect --no-ai
 ```
 
+System scan:
+
+```bash
+nview system-scan --profile quick --ai
+```
+
+Discovery scan:
+
+```bash
+nview discover --target 10.10.10.0/24
+```
+
 Review history:
 
 ```bash

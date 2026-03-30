@@ -7,6 +7,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
+import socket
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
@@ -58,6 +60,7 @@ CONFIG_DIR = Path.home() / ".config" / "nview"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 OUTPUT_DIR = Path.cwd() / "nview-results"
 ENV_FILE = Path.cwd() / ".env"
+UPDATE_STAMP_FILE = CONFIG_DIR / "last_update_check.txt"
 
 PROVIDER_CEREBRAS = "cerebras"
 PROVIDER_OPENROUTER = "openrouter"
@@ -141,6 +144,19 @@ def load_dotenv_file(path: Path) -> None:
             os.environ[key] = value
 
 
+def env_candidates() -> list[Path]:
+    repo_env = Path(__file__).resolve().parent.parent / ".env"
+    global_env = CONFIG_DIR / ".env"
+    cwd_env = Path.cwd() / ".env"
+    # Load in this order so current working directory has highest precedence.
+    return [global_env, repo_env, cwd_env]
+
+
+def load_env_chain() -> None:
+    for env_path in env_candidates():
+        load_dotenv_file(env_path)
+
+
 def apply_env_overrides(cfg: AIConfig) -> AIConfig:
     cerebras_key = os.getenv("CEREBRAS_API_KEY", "").strip()
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -162,19 +178,26 @@ def apply_env_overrides(cfg: AIConfig) -> AIConfig:
 
 
 def load_config() -> AIConfig:
-    load_dotenv_file(ENV_FILE)
+    load_env_chain()
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         cfg = AIConfig()
         CONFIG_FILE.write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
-        return apply_env_overrides(cfg)
+        cfg = apply_env_overrides(cfg)
+        save_config(cfg)
+        return cfg
     try:
-        cfg = AIConfig.from_dict(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
-        return apply_env_overrides(cfg)
+        original = AIConfig.from_dict(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
+        cfg = apply_env_overrides(AIConfig.from_dict(original.to_dict()))
+        if cfg.to_dict() != original.to_dict():
+            save_config(cfg)
+        return cfg
     except Exception:
         cfg = AIConfig()
         CONFIG_FILE.write_text(json.dumps(cfg.to_dict(), indent=2), encoding="utf-8")
-        return apply_env_overrides(cfg)
+        cfg = apply_env_overrides(cfg)
+        save_config(cfg)
+        return cfg
 
 
 def save_config(cfg: AIConfig) -> None:
@@ -188,6 +211,10 @@ def mask_secret(secret: str) -> str:
     if len(secret) < 8:
         return "*" * len(secret)
     return f"{secret[:3]}...{secret[-3:]}"
+
+
+def local_scan_target() -> str:
+    return "127.0.0.1"
 
 
 def print_banner() -> None:
@@ -345,40 +372,99 @@ def install_command_aliases() -> tuple[list[str], list[str]]:
     created: list[str] = []
     notes: list[str] = []
     system, _ = detect_platform()
+    cli_entry = str(Path(__file__).resolve())
+
+    def ensure_windows_user_path(path_item: Path) -> None:
+        user_path = os.environ.get("Path", "")
+        segments = [p.strip() for p in user_path.split(";") if p.strip()]
+        if str(path_item) not in segments:
+            merged = ";".join(segments + [str(path_item)])
+            try:
+                import winreg
+
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment", 0, winreg.KEY_SET_VALUE) as key:
+                    winreg.SetValueEx(key, "Path", 0, winreg.REG_EXPAND_SZ, merged)
+                os.environ["Path"] = merged
+                notes.append("User PATH updated. Open a new terminal session to apply globally.")
+            except Exception:
+                notes.append("Could not update User PATH automatically. Add launcher directory manually.")
+
+    def ensure_unix_path(path_item: Path) -> None:
+        current_path = os.environ.get("PATH", "")
+        if str(path_item) in current_path.split(os.pathsep):
+            return
+
+        updated = False
+        for profile_name in [".bashrc", ".zshrc", ".profile"]:
+            profile_path = Path.home() / profile_name
+            line = f'export PATH="$PATH:{path_item}"'
+            try:
+                if profile_path.exists():
+                    content = profile_path.read_text(encoding="utf-8", errors="ignore")
+                    if line in content:
+                        updated = True
+                        continue
+                    profile_path.write_text(content.rstrip() + "\n" + line + "\n", encoding="utf-8")
+                    updated = True
+                elif profile_name == ".profile":
+                    profile_path.write_text(line + "\n", encoding="utf-8")
+                    updated = True
+            except Exception:
+                continue
+
+        if updated:
+            os.environ["PATH"] = current_path + os.pathsep + str(path_item)
+            notes.append("PATH updated in shell profile. Open a new terminal session to apply globally.")
+        else:
+            notes.append(f"Could not update shell profiles automatically. Add to PATH manually: {path_item}")
 
     if system == "windows":
         bin_dir = Path.home() / "AppData" / "Local" / "nview" / "bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
+        py_scripts_dir = Path(sysconfig.get_path("scripts"))
+        launcher_dirs = [bin_dir, py_scripts_dir]
+        for d in launcher_dirs:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                continue
 
         cmd_launcher = (
             "@echo off\r\n"
             "setlocal\r\n"
             "where py >nul 2>nul\r\n"
             "if %ERRORLEVEL%==0 (\r\n"
-            "  py -m nview.cli %*\r\n"
+            f"  py \"{cli_entry}\" %*\r\n"
             ") else (\r\n"
-            "  python -m nview.cli %*\r\n"
+            f"  python \"{cli_entry}\" %*\r\n"
             ")\r\n"
             "endlocal\r\n"
         )
-        nview_cmd = bin_dir / "nview.cmd"
-        nview_cmd.write_text(cmd_launcher, encoding="utf-8")
-        created.append(str(nview_cmd))
+        for d in launcher_dirs:
+            if not d.exists():
+                continue
 
-        n_dash_cmd = bin_dir / "n-view.cmd"
-        if n_dash_cmd.exists() or n_dash_cmd.is_symlink():
-            n_dash_cmd.unlink()
-        try:
-            n_dash_cmd.symlink_to(nview_cmd)
-            created.append(str(n_dash_cmd))
-        except Exception:
-            n_dash_cmd.write_text(cmd_launcher, encoding="utf-8")
-            created.append(str(n_dash_cmd))
-            notes.append("Windows symlink creation for n-view failed; created n-view.cmd launcher instead.")
+            nview_cmd = d / "nview.cmd"
+            try:
+                nview_cmd.write_text(cmd_launcher, encoding="utf-8")
+                created.append(str(nview_cmd))
+            except Exception:
+                continue
 
-        current_path = os.environ.get("PATH", "")
-        if str(bin_dir).lower() not in current_path.lower():
-            notes.append(f"Add this directory to PATH to use commands globally: {bin_dir}")
+            n_dash_cmd = d / "n-view.cmd"
+            if n_dash_cmd.exists() or n_dash_cmd.is_symlink():
+                try:
+                    n_dash_cmd.unlink()
+                except Exception:
+                    pass
+            try:
+                n_dash_cmd.symlink_to(nview_cmd)
+                created.append(str(n_dash_cmd))
+            except Exception:
+                n_dash_cmd.write_text(cmd_launcher, encoding="utf-8")
+                created.append(str(n_dash_cmd))
+                notes.append("Windows symlink creation for n-view failed; created n-view.cmd launcher instead.")
+
+            ensure_windows_user_path(d)
         return created, notes
 
     bin_dir = Path.home() / ".local" / "bin"
@@ -388,10 +474,10 @@ def install_command_aliases() -> tuple[list[str], list[str]]:
     launcher.write_text(
         "#!/usr/bin/env sh\n"
         "if command -v python3 >/dev/null 2>&1; then\n"
-        "  exec python3 -m nview.cli \"$@\"\n"
+        f"  exec python3 \"{cli_entry}\" \"$@\"\n"
         "fi\n"
         "if command -v python >/dev/null 2>&1; then\n"
-        "  exec python -m nview.cli \"$@\"\n"
+        f"  exec python \"{cli_entry}\" \"$@\"\n"
         "fi\n"
         "echo 'Python interpreter not found. Install Python 3.11+ and retry.' >&2\n"
         "exit 1\n",
@@ -410,10 +496,10 @@ def install_command_aliases() -> tuple[list[str], list[str]]:
         alias.write_text(
             "#!/usr/bin/env sh\n"
             "if command -v python3 >/dev/null 2>&1; then\n"
-            "  exec python3 -m nview.cli \"$@\"\n"
+            f"  exec python3 \"{cli_entry}\" \"$@\"\n"
             "fi\n"
             "if command -v python >/dev/null 2>&1; then\n"
-            "  exec python -m nview.cli \"$@\"\n"
+            f"  exec python \"{cli_entry}\" \"$@\"\n"
             "fi\n"
             "echo 'Python interpreter not found. Install Python 3.11+ and retry.' >&2\n"
             "exit 1\n",
@@ -423,9 +509,7 @@ def install_command_aliases() -> tuple[list[str], list[str]]:
         created.append(str(alias))
         notes.append("Symlink creation for n-view failed; created executable wrapper instead.")
 
-    current_path = os.environ.get("PATH", "")
-    if str(bin_dir) not in current_path.split(os.pathsep):
-        notes.append(f"Add this directory to PATH to use commands globally: {bin_dir}")
+    ensure_unix_path(bin_dir)
 
     return created, notes
 
@@ -447,6 +531,108 @@ def check_dependencies(auto_fix: bool = False) -> dict:
         "nmap_path": nmap_bin or "not found",
         "manual_install": manual_nmap_install_commands(),
     }
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def git_available() -> bool:
+    return shutil.which("git") is not None
+
+
+def run_git(*args: str) -> tuple[int, str, str]:
+    repo = repo_root()
+    proc = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def is_git_repo_clean() -> bool:
+    code, out, _ = run_git("status", "--porcelain")
+    return code == 0 and out == ""
+
+
+def dependencies_install_from_repo() -> tuple[bool, str]:
+    repo = repo_root()
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "pip"], check=False, capture_output=True, text=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(repo / "requirements.txt")], check=True, capture_output=True, text=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-e", str(repo)], check=True, capture_output=True, text=True)
+        return True, "Dependencies synced"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def check_update_available() -> tuple[bool, str]:
+    if not git_available():
+        return False, "git is not available"
+
+    code, _, err = run_git("rev-parse", "--is-inside-work-tree")
+    if code != 0:
+        return False, f"not a git repo: {err}"
+
+    code, _, err = run_git("fetch", "origin")
+    if code != 0:
+        return False, f"fetch failed: {err}"
+
+    code, local_head, err = run_git("rev-parse", "HEAD")
+    if code != 0:
+        return False, f"cannot read local HEAD: {err}"
+
+    code, remote_head, err = run_git("rev-parse", "origin/main")
+    if code != 0:
+        return False, f"cannot read remote main: {err}"
+
+    if local_head != remote_head:
+        return True, "remote updates found"
+    return False, "already up to date"
+
+
+def perform_tool_update() -> tuple[bool, str]:
+    if not git_available():
+        return False, "git is not available"
+    if not is_git_repo_clean():
+        return False, "working tree is not clean; skipping auto-update"
+
+    available, reason = check_update_available()
+    if not available:
+        return False, reason
+
+    code, _, err = run_git("pull", "--ff-only", "origin", "main")
+    if code != 0:
+        return False, f"pull failed: {err}"
+
+    ok, dep_reason = dependencies_install_from_repo()
+    if not ok:
+        return False, f"updated code, but dependency sync failed: {dep_reason}"
+
+    return True, "tool updated successfully"
+
+
+def should_run_startup_update_check() -> bool:
+    if os.getenv("NVIEW_DISABLE_AUTO_UPDATE", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    if len(sys.argv) > 1 and sys.argv[1] in {"update"}:
+        return False
+    return True
+
+
+def mark_update_check_now() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    UPDATE_STAMP_FILE.write_text(datetime.now().isoformat(), encoding="utf-8")
+
+
+def startup_auto_update() -> None:
+    if not should_run_startup_update_check():
+        return
+
+    console.print("[cyan]Checking for N-VIEW updates...[/cyan]")
+    updated, message = perform_tool_update()
+    if updated:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[dim]Update check: {message}[/dim]")
+    mark_update_check_now()
 
 
 def validate_target(target: str) -> None:
@@ -568,6 +754,23 @@ def choose_scan_profile() -> tuple[str, str]:
         return normalize_natural_language(intent)
     raw = Prompt.ask("Enter custom nmap flags", default="-sV --top-ports 100")
     return raw, "Custom"
+
+
+def choose_system_scan_profile() -> tuple[str, str]:
+    options = [
+        "Local quick scan (top 200 ports + service detection)",
+        "Local full TCP scan (all ports)",
+        "Local aggressive scan (OS/scripts/traceroute)",
+        "Local vulnerability scan (NSE vuln)",
+    ]
+    choice = numbered_choice("Choose local system scan profile", options, default=1)
+    if choice == 1:
+        return "-sV --top-ports 200 -T4", "Local quick scan"
+    if choice == 2:
+        return "-p- -sV -T4", "Local full TCP scan"
+    if choice == 3:
+        return "-A -T4", "Local aggressive scan"
+    return "-sV --script vuln", "Local NSE vulnerability scan"
 
 
 def run_scan(
@@ -1202,7 +1405,58 @@ def scan_center_menu(cfg: AIConfig) -> None:
             [
                 "Guided scan profiles",
                 "Natural-language quick scan",
+                "Target list scan from file",
+                "Local system scan",
                 "Custom raw Nmap flags",
+                "Back",
+            ],
+            default=1,
+        )
+        if selection == 6:
+            return
+
+        target_file = None
+        target = None
+        if selection == 3:
+            target_file = Path(Prompt.ask("Enter target file path"))
+        elif selection == 4:
+            target = local_scan_target()
+        else:
+            target = Prompt.ask("Enter target (IP, CIDR, or host)")
+
+        if selection == 1:
+            flags, profile_name = choose_scan_profile()
+        elif selection == 2:
+            intent = Prompt.ask("Describe the scan intent")
+            flags, profile_name = normalize_natural_language(intent)
+        elif selection == 3:
+            flags = Prompt.ask("Flags for file-based scan", default="-sV --top-ports 100 -T4")
+            profile_name = "Target file scan"
+        elif selection == 4:
+            flags, profile_name = choose_system_scan_profile()
+        else:
+            flags = Prompt.ask("Enter raw Nmap flags", default="-sV --top-ports 100 -T4")
+            profile_name = "Custom"
+
+        run_scan_pipeline(
+            target=target,
+            target_file=target_file,
+            flags=flags,
+            profile_name=profile_name,
+            cfg=cfg,
+            ask_for_ai=True,
+            generate_ai=True,
+        )
+
+
+def discovery_menu(cfg: AIConfig) -> None:
+    while True:
+        selection = numbered_choice(
+            "Discovery Center",
+            [
+                "Host discovery (single target)",
+                "Subnet sweep (CIDR)",
+                "Local network discovery",
                 "Back",
             ],
             default=1,
@@ -1210,17 +1464,22 @@ def scan_center_menu(cfg: AIConfig) -> None:
         if selection == 4:
             return
 
-        target = Prompt.ask("Enter target (IP, CIDR, or host)")
         if selection == 1:
-            flags, profile_name = choose_scan_profile()
+            target = Prompt.ask("Target host or IP")
         elif selection == 2:
-            intent = Prompt.ask("Describe the scan intent")
-            flags, profile_name = normalize_natural_language(intent)
+            target = Prompt.ask("Target CIDR (example: 192.168.1.0/24)")
         else:
-            flags = Prompt.ask("Enter raw Nmap flags", default="-sV --top-ports 100 -T4")
-            profile_name = "Custom"
+            target = local_scan_target()
 
-        run_scan_pipeline(target=target, flags=flags, profile_name=profile_name, cfg=cfg, ask_for_ai=True, generate_ai=True)
+        run_scan_pipeline(
+            target=target,
+            flags="-sn",
+            profile_name="Discovery scan",
+            cfg=cfg,
+            ask_for_ai=False,
+            generate_ai=False,
+            always_show_report=False,
+        )
 
 
 def report_center_menu() -> None:
@@ -1266,7 +1525,7 @@ def tools_menu() -> None:
             [
                 "Run health check (doctor)",
                 "Run production bootstrap",
-                "Show active .env path",
+                "Show env source paths",
                 "Back",
             ],
             default=1,
@@ -1278,7 +1537,14 @@ def tools_menu() -> None:
         elif selection == 2:
             bootstrap()
         else:
-            console.print(f"[cyan]Using env file:[/cyan] {ENV_FILE}")
+            table = Table(title="N-VIEW Environment Sources")
+            table.add_column("Source", style="cyan")
+            table.add_column("Path", style="white")
+            table.add_column("Exists", style="white")
+            for item in env_candidates():
+                table.add_row(".env", str(item), "yes" if item.exists() else "no")
+            table.add_row("Persistent config", str(CONFIG_FILE), "yes" if CONFIG_FILE.exists() else "no")
+            console.print(table)
 
 
 @app.command("menu")
@@ -1300,9 +1566,12 @@ def menu_mode() -> None:
             "Main Menu",
             [
                 "Scan Center",
+                "Discovery Center",
+                "Local System Scan",
                 "Report Center",
                 "AI Provider Settings",
                 "Tools & Diagnostics",
+                "Update Tool",
                 "Exit",
             ],
             default=1,
@@ -1311,12 +1580,26 @@ def menu_mode() -> None:
         if action == 1:
             scan_center_menu(cfg)
         elif action == 2:
-            report_center_menu()
+            discovery_menu(cfg)
         elif action == 3:
+            flags, profile = choose_system_scan_profile()
+            run_scan_pipeline(
+                target=local_scan_target(),
+                flags=flags,
+                profile_name=profile,
+                cfg=cfg,
+                ask_for_ai=True,
+                generate_ai=True,
+            )
+        elif action == 4:
+            report_center_menu()
+        elif action == 5:
             configure_ai()
             cfg = load_config()
-        elif action == 4:
+        elif action == 6:
             tools_menu()
+        elif action == 7:
+            update_tool()
         else:
             console.print("[yellow]Goodbye from N-VIEW.[/yellow]")
             return
@@ -1379,6 +1662,54 @@ def scan_non_interactive(
         always_show_report=show_report,
     )
     console.print("[bold cyan]Done.[/bold cyan]")
+
+
+@app.command("system-scan")
+def system_scan(
+    profile: str = typer.Option("quick", "--profile", help="Profile: quick, full, aggressive, vuln."),
+    ai: bool = typer.Option(True, "--ai/--no-ai", help="Generate AI report after scan."),
+) -> None:
+    """Scan local system for open ports and services."""
+    print_banner()
+    cfg = load_config()
+    choice = profile.strip().lower()
+    if choice == "quick":
+        flags, profile_name = ("-sV --top-ports 200 -T4", "Local quick scan")
+    elif choice == "full":
+        flags, profile_name = ("-p- -sV -T4", "Local full TCP scan")
+    elif choice == "aggressive":
+        flags, profile_name = ("-A -T4", "Local aggressive scan")
+    elif choice in {"vuln", "vulnerability"}:
+        flags, profile_name = ("-sV --script vuln", "Local NSE vulnerability scan")
+    else:
+        raise typer.BadParameter("Invalid profile. Use quick|full|aggressive|vuln")
+
+    run_scan_pipeline(
+        target=local_scan_target(),
+        flags=flags,
+        profile_name=profile_name,
+        cfg=cfg,
+        ask_for_ai=False,
+        generate_ai=ai,
+    )
+
+
+@app.command("discover")
+def discover(
+    target: str = typer.Option(..., "--target", "-t", help="Host or CIDR target for discovery."),
+) -> None:
+    """Run host discovery only (ping sweep style)."""
+    print_banner()
+    cfg = load_config()
+    run_scan_pipeline(
+        target=target,
+        flags="-sn",
+        profile_name="Discovery scan",
+        cfg=cfg,
+        ask_for_ai=False,
+        generate_ai=False,
+        always_show_report=False,
+    )
 
 
 @app.command("history")
@@ -1542,7 +1873,20 @@ def bootstrap(
             console.print(f"[cyan]- {note}[/cyan]")
 
 
+@app.command("update")
+def update_tool() -> None:
+    """Check remote updates and update local tool and dependencies."""
+    print_banner()
+    console.print("[cyan]Running manual update...[/cyan]")
+    updated, message = perform_tool_update()
+    if updated:
+        console.print(f"[green]{message}[/green]")
+    else:
+        console.print(f"[yellow]{message}[/yellow]")
+
+
 def entry() -> None:
+    startup_auto_update()
     if len(sys.argv) == 1:
         sys.argv.append("menu")
     app()
