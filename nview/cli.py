@@ -14,6 +14,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from time import sleep
 from typing import Optional
 
 import httpx
@@ -21,7 +22,7 @@ import typer
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
@@ -33,6 +34,7 @@ APP_VERSION = "2.0.0"
 AUTHOR = "Fahad Khan (cybe4sent1nel)"
 DEVELOPER = "cybe4sent1nel"
 PAYPAL = "fahadkhanxyz8816@gmail.com"
+PAYPAL_LINK = "https://paypal.me/fahadkhanxyz8816"
 TAGLINE = "Professional Network Visibility, Simplified."
 
 AI_SYSTEM_PROMPT = """
@@ -228,7 +230,7 @@ def print_banner() -> None:
 """
     subtitle = f"[bold white]{APP_NAME} v{APP_VERSION}[/bold white]  [bright_cyan]Developed by {AUTHOR}[/bright_cyan]"
     tagline = f"[bold green]{TAGLINE}[/bold green]"
-    sponsor = f"[bold magenta]Sponsor our project[/bold magenta]: {PAYPAL}"
+    sponsor = f"[bold magenta]Sponsor via PayPal[/bold magenta]: {PAYPAL_LINK} ([bright_magenta]{PAYPAL}[/bright_magenta])"
     console.print(
         Panel.fit(
             f"[bold blue]{art}[/bold blue]\n{subtitle}\n{tagline}\n{sponsor}",
@@ -236,6 +238,26 @@ def print_banner() -> None:
             border_style="bright_blue",
         )
     )
+
+
+def startup_animation() -> None:
+    if os.getenv("NVIEW_DISABLE_ANIMATIONS", "").strip().lower() in {"1", "true", "yes"}:
+        return
+    with Progress(
+        SpinnerColumn(style="bright_cyan"),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=30, complete_style="bright_cyan", finished_style="bright_green"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Initializing N-VIEW engines...", total=100)
+        for description, step in [
+            ("Loading command modules", 35),
+            ("Validating runtime dependencies", 35),
+            ("Preparing interactive interface", 30),
+        ]:
+            progress.update(task, description=f"[cyan]{description}[/cyan]", advance=step)
+            sleep(0.12)
 
 
 def render_ai_report(report_text: str, provider: str) -> None:
@@ -812,7 +834,12 @@ def run_scan(
     last_finished = datetime.now()
     for attempt in range(1, max_attempts + 1):
         last_started = datetime.now()
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+        with Progress(
+            SpinnerColumn(style="bright_cyan"),
+            TextColumn("[progress.description]{task.description}"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
             task_id = progress.add_task(f"Running Nmap scan (attempt {attempt}/{max_attempts})...", total=None)
             proc = subprocess.run(cmd, capture_output=True, text=True)
             progress.update(task_id, description="Scan finished")
@@ -977,7 +1004,12 @@ def generate_ai_report(
         xml_excerpt=xml_excerpt,
     )
 
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
+    with Progress(
+        SpinnerColumn(style="bright_magenta"),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
         progress.add_task("Generating AI report...", total=None)
         try:
             if cfg.provider == PROVIDER_CEREBRAS:
@@ -1886,6 +1918,7 @@ def update_tool() -> None:
 
 
 def entry() -> None:
+    startup_animation()
     startup_auto_update()
     if len(sys.argv) == 1:
         sys.argv.append("menu")
